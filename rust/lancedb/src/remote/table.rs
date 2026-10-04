@@ -1172,6 +1172,11 @@ impl<S: HttpSend> RemoteTable<S> {
                         .as_any()
                         .downcast_ref::<arrow_array::Float32Array>()
                         .unwrap();
+                    if vector.null_count() > 0 {
+                        return Err(Error::InvalidInput {
+                            message: "query vector must not contain null values".into(),
+                        });
+                    }
                     Ok(serde_json::Value::Array(
                         array
                             .values()
@@ -5890,6 +5895,124 @@ mod tests {
 
         let error = table.fetch_blobs("image", &[10]).await.unwrap_err();
         assert_fetch_blobs_http_error(error, "got 'application/json'");
+    }
+
+    #[rstest]
+    #[case(DEFAULT_SERVER_VERSION.clone(), 0.0)]
+    #[case(DEFAULT_SERVER_VERSION.clone(), 123.0)]
+    #[case(semver::Version::new(0, 2, 0), 0.0)]
+    #[case(semver::Version::new(0, 2, 0), 123.0)]
+    #[tokio::test]
+    async fn test_query_vector_null_coordinate(
+        #[case] version: semver::Version,
+        #[case] null_storage: f32,
+    ) {
+        let table = Table::new_with_handler_version("my_table", version, move |request| {
+            let body: serde_json::Value =
+                serde_json::from_slice(request.body().unwrap().as_bytes().unwrap()).unwrap();
+            eprintln!("unexpected nullable query request: {}", body["vector"]);
+            let response = RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)])),
+                vec![Arc::new(Int32Array::from(vec![1]))],
+            )
+            .unwrap();
+            http::Response::builder()
+                .status(200)
+                .header(CONTENT_TYPE, ARROW_FILE_CONTENT_TYPE)
+                .body(write_ipc_file(&response))
+                .unwrap()
+        });
+        // These have the same logical Arrow values [0.1, null], regardless of
+        // the data stored underneath the invalid coordinate.
+        let vector: Arc<dyn Array> = Arc::new(arrow_array::Float32Array::new(
+            vec![0.1, null_storage].into(),
+            Some(arrow::buffer::NullBuffer::from(vec![true, false])),
+        ));
+        let result = match table.query().nearest_to(vector) {
+            Ok(query) => query.execute().await,
+            Err(error) => Err(error),
+        };
+        assert!(matches!(result, Err(Error::InvalidInput { .. })));
+    }
+
+    #[rstest]
+    #[case(DEFAULT_SERVER_VERSION.clone(), false)]
+    #[case(DEFAULT_SERVER_VERSION.clone(), true)]
+    #[case(semver::Version::new(0, 2, 0), false)]
+    #[case(semver::Version::new(0, 2, 0), true)]
+    #[tokio::test]
+    async fn test_query_vector_null_direct_request(
+        #[case] version: semver::Version,
+        #[case] batched: bool,
+    ) {
+        let table =
+            Table::new_with_handler_version("my_table", version, |_| -> http::Response<String> {
+                panic!("nullable vectors must be rejected before sending a request")
+            });
+        let mut request = table
+            .query()
+            .nearest_to(&[0.1, 0.2])
+            .unwrap()
+            .into_request();
+        if !batched {
+            request.query_vector.clear();
+        }
+        request
+            .query_vector
+            .push(Arc::new(arrow_array::Float32Array::from(vec![
+                Some(0.1),
+                None,
+            ])));
+        let result = table
+            .base_table()
+            .query(
+                &AnyQuery::VectorQuery(request),
+                QueryExecutionOptions::default(),
+            )
+            .await;
+        assert!(matches!(result, Err(Error::InvalidInput { .. })));
+    }
+
+    #[rstest]
+    #[case(DEFAULT_SERVER_VERSION.clone())]
+    #[case(semver::Version::new(0, 2, 0))]
+    #[tokio::test]
+    async fn test_query_vector_null_controls(#[case] version: semver::Version) {
+        let expected: serde_json::Value = vec![0.1f32, 0.2].into();
+        let table = Table::new_with_handler_version("my_table", version, move |request| {
+            let body: serde_json::Value =
+                serde_json::from_slice(request.body().unwrap().as_bytes().unwrap()).unwrap();
+            assert_eq!(body["vector"], expected);
+            let response = RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)])),
+                vec![Arc::new(Int32Array::from(vec![1]))],
+            )
+            .unwrap();
+            http::Response::builder()
+                .status(200)
+                .header(CONTENT_TYPE, ARROW_FILE_CONTENT_TYPE)
+                .body(write_ipc_file(&response))
+                .unwrap()
+        });
+        let sliced =
+            arrow_array::Float32Array::from(vec![None, Some(0.1), Some(0.2), None]).slice(1, 2);
+        let all_valid = arrow_array::Float32Array::new(
+            vec![0.1f32, 0.2].into(),
+            Some(arrow::buffer::NullBuffer::from(vec![true, true])),
+        );
+        for vector in [Arc::new(sliced) as Arc<dyn Array>, Arc::new(all_valid)] {
+            let batches = table
+                .query()
+                .nearest_to(vector)
+                .unwrap()
+                .execute()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            assert_eq!(batches[0].num_rows(), 1);
+        }
     }
 
     #[tokio::test]
