@@ -203,9 +203,14 @@ pub async fn create_plan(
                 Some(query.query_vector[0].len() as i32),
             )?);
         }
-        let vector_field = schema.field(column.as_ref().unwrap()).unwrap();
+        let vector_column = column.as_ref().unwrap();
+        let vector_field = schema
+            .field(vector_column)
+            .ok_or_else(|| Error::InvalidInput {
+                message: format!("Vector column '{vector_column}' does not exist in schema"),
+            })?;
         let (_, element_type) =
-            lance::index::vector::utils::get_vector_type(schema, column.as_ref().unwrap())?;
+            lance::index::vector::utils::get_vector_type(schema, vector_column)?;
         let is_binary = matches!(element_type, DataType::UInt8);
         if matches!(vector_field.data_type(), DataType::List(_))
             || (query.base.offset.unwrap_or(0) == 0 && !is_binary)
@@ -868,6 +873,57 @@ mod tests {
 
     fn fixed_size_list_array(values: Vec<f32>, dimension: i32) -> FixedSizeListArray {
         FixedSizeListArray::try_new_from_values(Float32Array::from(values), dimension).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_vector_query_missing_column_returns_error() {
+        use crate::connect;
+        use arrow_schema::Field;
+
+        let conn = connect("memory://").execute().await.unwrap();
+        let vectors = Arc::new(fixed_size_list_array(vec![1.0, 0.0, 0.0, 1.0], 2));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vector",
+            vectors.data_type().clone(),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![vectors as ArrayRef]).unwrap();
+        let table = conn
+            .create_table("missing_vector_column", vec![batch])
+            .execute()
+            .await
+            .unwrap();
+
+        for query_count in [1, 2] {
+            let mut query = table.query().nearest_to(&[1.0, 0.0]).unwrap();
+            if query_count == 2 {
+                query = query.add_query_vector(&[0.0, 1.0]).unwrap();
+            }
+            let result = query.column("missing").limit(1).execute().await;
+            let error = match result {
+                Ok(_) => panic!("query on a missing column should fail"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("missing"), "{error}");
+
+            let mut query = table.query().nearest_to(&[1.0, 0.0]).unwrap();
+            if query_count == 2 {
+                query = query.add_query_vector(&[0.0, 1.0]).unwrap();
+            }
+            let batches = query
+                .column("vector")
+                .limit(1)
+                .execute()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            assert_eq!(
+                batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                query_count
+            );
+        }
     }
 
     #[tokio::test]
